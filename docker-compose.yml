@@ -8,12 +8,22 @@ services:
       - "8000:8000"
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
-      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
-      - COLPALI_MODEL_NAME=${COLPALI_MODEL_NAME:-vidore/colpali-v1.2}
-      - COLPALI_DEVICE=${COLPALI_DEVICE:-cpu}
+      - GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}
+      - COLPALI_MODEL_NAME=${COLPALI_MODEL_NAME:-VAGOsolutions/SauerkrautLM-ColLFM2-450M-v0.1}
+      - COLPALI_DEVICE=${COLPALI_DEVICE:-cuda}
       - TOP_K=${TOP_K:-5}
+      # Allow torch to use the host GPU
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
   frontend:

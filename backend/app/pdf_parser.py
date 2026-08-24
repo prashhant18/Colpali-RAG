@@ -1,11 +1,18 @@
-"""PDF parsing utilities: text extraction and page-to-image conversion."""
+"""PDF parsing utilities: streaming text extraction and page rendering.
 
-import io
+Everything goes through pypdfium2 in a SINGLE pass: per page we extract text
+and render an image, hand both to the caller, then release the page's native
+resources immediately. Peak memory is roughly ONE rendered page instead of
+the whole document, which matters on 8 GB machines.
+
+(The previous implementation opened the PDF twice — pypdf for text and
+pypdfium2 for images — and materialised every page image up front.)
+"""
+
 import logging
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
-import pypdf
 import pypdfium2 as pdfium  # type: ignore
 from PIL import Image
 
@@ -16,72 +23,75 @@ class PDFParseError(Exception):
     """Raised when a PDF cannot be parsed."""
 
 
-def extract_text(file_obj: BinaryIO) -> list[str]:
-    """Extract text per page from a PDF file object.
+def iter_pdf_pages(
+    source: str | Path | BinaryIO, dpi: int = 96
+) -> Iterator[tuple[int, int, str, Image.Image]]:
+    """Yield ``(page_number, total_pages, text, image)`` one page at a time.
 
     Args:
-        file_obj: A binary file-like object containing the PDF.
+        source: Path to a PDF file or a binary file-like object.
+        dpi: Rendering resolution. 96 DPI (~1.33x) keeps memory low on
+            resource-constrained machines while preserving layout for ColLFM2.
 
-    Returns:
-        A list of strings, one per page (in order).
+    Yields:
+        Tuples of (1-based page number, total page count, extracted text,
+        rendered PIL image).
 
     Raises:
-        PDFParseError: If the PDF cannot be read.
+        PDFParseError: If the PDF cannot be opened or processed.
     """
     try:
-        reader = pypdf.PdfReader(file_obj)
-        pages: list[str] = []
-        for page in reader.pages:
-            pages.append(page.extract_text() or "")
-        return pages
+        pdf = pdfium.PdfDocument(source)
     except Exception as exc:  # noqa: BLE001
-        raise PDFParseError(f"Failed to extract text: {exc}") from exc
+        raise PDFParseError(f"Failed to open PDF: {exc}") from exc
 
-
-def render_page_images(file_obj: BinaryIO, dpi: int = 144) -> list[Image.Image]:
-    """Render each page of a PDF to a PIL image.
-
-    Uses pypdfium2 for fast, dependency-light rendering (no poppler required).
-
-    Args:
-        file_obj: A binary file-like object containing the PDF.
-        dpi: Rendering resolution. 144 DPI (~2x) balances quality and size.
-
-    Returns:
-        A list of PIL Images, one per page.
-
-    Raises:
-        PDFParseError: If the PDF cannot be rendered.
-    """
-    try:
-        file_obj.seek(0)
-        pdf = pdfium.PdfDocument(file_obj)
-        images: list[Image.Image] = []
-        scale = dpi / 72.0
-        for page in pdf:
-            bitmap = page.render(scale=scale)
-            pil_image = bitmap.to_pil()
-            images.append(pil_image)
+    total = len(pdf)
+    if total == 0:
         pdf.close()
-        return images
+        return
+
+    scale = dpi / 72.0
+    try:
+        for index in range(total):
+            page = pdf[index]
+            try:
+                # --- Text (same pass, no second library needed) ---
+                text = ""
+                try:
+                    textpage = page.get_textpage()
+                    try:
+                        text = textpage.get_text_range() or ""
+                    finally:
+                        textpage.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Text extraction failed on page %d: %s", index + 1, exc
+                    )
+
+                # --- Image ---
+                bitmap = page.render(scale=scale)
+                image = bitmap.to_pil()  # copies pixels out of the native buffer
+                del bitmap  # release pdfium's pixel buffer right away
+            finally:
+                page.close()
+
+            yield index + 1, total, text, image
+            # `image` is dropped by the caller's loop; nothing accumulates.
+    except PDFParseError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        raise PDFParseError(f"Failed to render pages: {exc}") from exc
+        raise PDFParseError(f"Failed while processing pages: {exc}") from exc
+    finally:
+        pdf.close()
 
 
-def parse_pdf(file_obj: BinaryIO) -> tuple[list[str], list[Image.Image]]:
-    """Parse a PDF into per-page text and images.
-
-    Args:
-        file_obj: A binary file-like object containing the PDF.
-
-    Returns:
-        A tuple of (page_texts, page_images).
-    """
-    file_obj.seek(0)
-    texts = extract_text(file_obj)
-    images = render_page_images(file_obj)
-    if len(texts) != len(images):
-        logger.warning(
-            "Text/image page count mismatch: %d vs %d", len(texts), len(images)
-        )
-    return texts, images
+def count_pages(source: str | Path | BinaryIO) -> int:
+    """Return the number of pages in a PDF without processing it."""
+    try:
+        pdf = pdfium.PdfDocument(source)
+        try:
+            return len(pdf)
+        finally:
+            pdf.close()
+    except Exception as exc:  # noqa: BLE001
+        raise PDFParseError(f"Failed to open PDF: {exc}") from exc

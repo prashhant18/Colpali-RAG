@@ -1,18 +1,20 @@
 """FastAPI application entrypoint for the RAG research-paper assistant."""
 
-import io
 import json
 import logging
+import queue
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from .config import settings
 from .llm import GroqLLM
-from .pdf_parser import PDFParseError, parse_pdf
+from .pdf_parser import PDFParseError, iter_pdf_pages
 from .retriever import ColPaliRetriever
 from .schemas import AskRequest, HealthResponse, UploadResponse
 
@@ -24,6 +26,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 retriever: ColPaliRetriever | None = None
 llm: GroqLLM | None = None
+
+# Only one ingestion at a time: embedding is memory-heavy and this app targets
+# an 8 GB RAM machine — concurrent uploads would thrash memory.
+ingest_semaphore = threading.Semaphore(1)
 
 
 @asynccontextmanager
@@ -42,7 +48,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Research Paper RAG Assistant",
-    description="ColPali + Groq powered retrieval-augmented generation for PDFs.",
+    description="SauerkrautLM-ColLFM2 + Groq powered retrieval-augmented generation for PDFs.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -70,42 +76,121 @@ async def health() -> HealthResponse:
     )
 
 
-@app.post("/upload", response_model=UploadResponse)
-async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
-    """Upload and ingest a PDF into the vector store."""
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)) -> StreamingResponse:
+    """Upload and ingest a PDF into the vector store.
+
+    Progress is streamed back as server-sent events so the frontend can show
+    a live progress bar. The heavy work (rendering + embedding) runs in a
+    worker thread, keeping the event loop free so other requests stay
+    responsive during ingestion.
+    """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
-    # Size check
-    contents = await file.read()
-    if len(contents) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File exceeds {settings.max_upload_mb} MB limit.",
-        )
-
-    # Persist a copy
     safe_name = Path(file.filename).name
     dest = settings.upload_dir / safe_name
-    dest.write_bytes(contents)
+    max_bytes = settings.max_upload_mb * 1024 * 1024
 
-    # Parse
+    if not ingest_semaphore.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Another upload is currently being processed. Please wait.",
+        )
+
+    # Stream the upload to disk in fixed-size chunks instead of holding the
+    # whole file in memory; enforce the size limit while copying.
     try:
-        page_texts, page_images = parse_pdf(io.BytesIO(contents))
-    except PDFParseError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        bytes_written = 0
+        with dest.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds {settings.max_upload_mb} MB limit.",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        ingest_semaphore.release()
+        raise
 
-    if not page_texts:
-        raise HTTPException(status_code=400, detail="PDF has no readable pages.")
+    progress_queue: queue.Queue = queue.Queue()
+    cancel_event = threading.Event()
 
-    # Ingest
-    assert retriever is not None
-    pages = retriever.add_document(safe_name, page_texts, page_images)
+    def ingest_worker() -> None:
+        """Run parsing + embedding off the event loop; report via the queue."""
+        success = False
+        try:
+            def on_progress(current: int, total: int) -> None:
+                progress_queue.put(
+                    {"type": "progress", "current": current, "total": total}
+                )
 
-    return UploadResponse(
-        filename=safe_name,
-        pages=pages,
-        message=f"Ingested {pages} pages from {safe_name}.",
+            # Wrap the page iterator so a client disconnect aborts ingestion
+            # after the current page instead of embedding the whole document.
+            def pages():
+                for item in iter_pdf_pages(dest, dpi=settings.render_dpi):
+                    if cancel_event.is_set():
+                        return
+                    yield item
+
+            assert retriever is not None
+            count = retriever.ingest_document(
+                safe_name, pages(), progress_cb=on_progress
+            )
+
+            if cancel_event.is_set():
+                return
+
+            result = UploadResponse(
+                filename=safe_name,
+                pages=count,
+                message=f"Ingested {count} pages from {safe_name}.",
+            )
+            progress_queue.put({"type": "done", **result.model_dump()})
+            success = True
+        except PDFParseError as exc:
+            progress_queue.put({"type": "error", "detail": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ingestion failed for %s", safe_name)
+            progress_queue.put({"type": "error", "detail": f"Ingestion failed: {exc}"})
+        finally:
+            progress_queue.put(None)  # sentinel: stream ends
+            ingest_semaphore.release()
+            if not success:
+                dest.unlink(missing_ok=True)
+
+    async def event_stream():
+        yield f"data: {json.dumps({'type': 'start', 'filename': safe_name})}\n\n"
+        yield f"data: {json.dumps({'type': 'parsing'})}\n\n"
+
+        worker = threading.Thread(target=ingest_worker, daemon=True)
+        worker.start()
+        try:
+            while True:
+                # Blocking get() runs in the threadpool so the event loop (and
+                # therefore /ask, /health, ...) stays responsive throughout.
+                event = await run_in_threadpool(progress_queue.get)
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            # Client disconnected mid-ingest: tell the worker to stop early.
+            cancel_event.set()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -123,7 +208,9 @@ async def ask(request: AskRequest) -> StreamingResponse:
         )
 
     assert retriever is not None
-    hits = retriever.retrieve(request.question, top_k=request.top_k)
+    # Retrieval embeds the query with the local model; run it in a worker
+    # thread so model inference never blocks the event loop either.
+    hits = await run_in_threadpool(retriever.retrieve, request.question, request.top_k)
     if not hits:
         raise HTTPException(
             status_code=404, detail="No relevant pages found. Upload papers first."
@@ -139,9 +226,17 @@ async def ask(request: AskRequest) -> StreamingResponse:
         ]
         yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
 
-        # Stream the answer
-        async for chunk in llm.stream_answer(request.question, context):
-            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+        # Stream the answer. Any failure (bad model id, network, quota, ...)
+        # is reported as an SSE 'error' event so the UI can show it instead
+        # of the whole request crashing mid-stream.
+        try:
+            async for chunk in llm.stream_answer(request.question, context):
+                yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+        except Exception as exc:
+            logger.exception("LLM streaming failed for question: %s", request.question)
+            detail = str(exc) or exc.__class__.__name__
+            yield f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
+            return
 
         yield "data: {\"type\": \"done\"}\n\n"
 

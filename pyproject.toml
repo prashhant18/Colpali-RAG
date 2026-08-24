@@ -6,8 +6,32 @@ readme = "README.md"
 authors = [
     { name = "Prashant Bhatnagar", email = "prashantexe18@gmail.com" }
 ]
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pdf2image>=1.17.0",
+    "pillow>=12.3.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "pypdf>=6.16.1",
+    "pypdfium>=0.0.15",
+    "pypdfium2>=5.13.0",
+    "python-multipart>=0.0.32",
+    "sentencepiece>=0.2.2",
+    "starlette>=1.6.0",
+    "transformers>=5.15.1",
+    "uvicorn[standard]>=0.52.4",
+    # --- CUDA-enabled PyTorch (from the cu126 index below) ---
+    # torch 2.8.0 satisfies sauerkrautlm-colpali's torch>=2.5.0,<2.9.0
+    # and has cp312 wheels for Python 3.12.
+    "torch==2.8.0+cu126",
+    "torchvision==0.23.0+cu126",
+    # --- ColLFM2 model package (SauerkrautLM-ColLFM2-450M) ---
+    "sauerkrautlm-colpali @ git+https://github.com/VAGOsolutions/sauerkrautlm-colpali",
+    "config>=0.5.1",
+]
 
 [project.scripts]
 genai-project = "genai_project:main"
@@ -15,3 +39,18 @@ genai-project = "genai_project:main"
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
+
+# ---------------------------------------------------------------------------
+# uv configuration
+# ---------------------------------------------------------------------------
+[tool.uv]
+# Use the PyTorch cu126 index for CUDA-enabled torch/torchvision wheels.
+# The default PyPI torch is CPU-only (raises "not compiled with CUDA enabled").
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }

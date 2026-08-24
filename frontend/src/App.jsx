@@ -8,6 +8,7 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [uploadStatus, setUploadStatus] = useState("");
   const [uploadError, setUploadError] = useState("");
+  const [uploadProgress, setUploadProgress] = useState(null); // {stage,current,total,filename}
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -22,7 +23,6 @@ export default function App() {
   // ------------------------------------------------------------------
   const handleFiles = useCallback(async (files) => {
     setUploadError("");
-    setUploadStatus("");
 
     for (const file of files) {
       if (!file.name.toLowerCase().endsWith(".pdf")) {
@@ -34,18 +34,76 @@ export default function App() {
       formData.append("file", file);
 
       try {
-        setUploadStatus(`Uploading ${file.name}...`);
+        setUploadProgress({
+          stage: "uploading",
+          current: 0,
+          total: 0,
+          filename: file.name,
+        });
         const res = await fetch(`${API_BASE}/upload`, {
           method: "POST",
           body: formData,
         });
-        const data = await res.json();
+
         if (!res.ok) {
+          // Validation errors (400/409/413) arrive as plain JSON before
+          // streaming starts.
+          const data = await res.json().catch(() => ({}));
           throw new Error(data.detail || "Upload failed");
         }
-        setUploadStatus(data.message);
+
+        // Ingestion progress streams back as SSE events (same format as /ask).
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finished = false;
+        let errorMessage = null;
+
+        while (!finished && !errorMessage) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // Parse SSE events (separated by blank lines)
+          const events = buffer.split("\n\n");
+          buffer = events.pop() || "";
+
+          for (const event of events) {
+            const line = event.trim();
+            if (!line.startsWith("data:")) continue;
+            const payload = JSON.parse(line.slice(5).trim());
+
+            if (payload.type === "parsing") {
+              setUploadProgress({
+                stage: "parsing",
+                current: 0,
+                total: 0,
+                filename: file.name,
+              });
+            } else if (payload.type === "progress") {
+              setUploadProgress({
+                stage: "embedding",
+                current: payload.current,
+                total: payload.total,
+                filename: file.name,
+              });
+            } else if (payload.type === "done") {
+              setUploadStatus(payload.message);
+              finished = true;
+              break;
+            } else if (payload.type === "error") {
+              errorMessage = payload.detail || "Ingestion failed";
+              break;
+            }
+          }
+        }
+
+        if (errorMessage) throw new Error(errorMessage);
+        if (!finished) throw new Error("Upload was interrupted.");
       } catch (err) {
         setUploadError(err.message);
+      } finally {
+        setTimeout(() => setUploadProgress(null), 500);
       }
     }
   }, []);
@@ -123,6 +181,19 @@ export default function App() {
                   : m
               )
             );
+          } else if (payload.type === "error") {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      content: `⚠️ ${payload.detail}`,
+                      isError: true,
+                    }
+                  : m
+              )
+            );
+            break;
           } else if (payload.type === "done") {
             break;
           }
@@ -147,6 +218,19 @@ export default function App() {
       sendMessage();
     }
   };
+
+  // Upload progress bar helpers
+  const uploadPercent =
+    uploadProgress && uploadProgress.total > 0
+      ? Math.round((uploadProgress.current / uploadProgress.total) * 100)
+      : null;
+  const uploadLabel = !uploadProgress
+    ? ""
+    : uploadProgress.stage === "uploading"
+      ? `Uploading ${uploadProgress.filename}…`
+      : uploadProgress.stage === "parsing"
+        ? "Parsing PDF…"
+        : `Embedding page ${uploadProgress.current} / ${uploadProgress.total}…`;
 
   // ------------------------------------------------------------------
   // Render
@@ -182,7 +266,27 @@ export default function App() {
           multiple
           onChange={(e) => handleFiles(e.target.files)}
         />
-        {uploadStatus && <div className="upload-status">{uploadStatus}</div>}
+        {uploadProgress && (
+          <div className="upload-progress">
+            <div className="upload-progress-label">{uploadLabel}</div>
+            <div
+              className={`progress-bar${uploadPercent === null ? " indeterminate" : ""}`}
+            >
+              {uploadPercent !== null && (
+                <div
+                  className="progress-fill"
+                  style={{ width: `${uploadPercent}%` }}
+                />
+              )}
+            </div>
+            {uploadPercent !== null && (
+              <div className="upload-progress-pct">{uploadPercent}%</div>
+            )}
+          </div>
+        )}
+        {uploadStatus && !uploadProgress && (
+          <div className="upload-status">{uploadStatus}</div>
+        )}
         {uploadError && <div className="upload-status error">{uploadError}</div>}
       </div>
 
@@ -196,7 +300,10 @@ export default function App() {
             </div>
           )}
           {messages.map((msg, i) => (
-            <div key={i} className={`message ${msg.role}`}>
+            <div
+              key={i}
+              className={`message ${msg.role}${msg.isError ? " error" : ""}`}
+            >
               {msg.content || (msg.role === "assistant" && isStreaming ? "…" : "")}
               {msg.sources && msg.sources.length > 0 && (
                 <div className="sources">

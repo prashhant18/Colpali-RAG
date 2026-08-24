@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-SYSTEM_PROMPT = """You are a research assistant helping users understand academic papers.
+SYSTEM_PROMPT = """You are a research assistant helping users understand academic papers or complex pdfs.
 
-You will be given retrieved page excerpts from research papers, each tagged with
+You will be given retrieved page excerpts from research papers or complex pdfs, each tagged with
 a source filename and page number. Answer the user's question using ONLY the
 provided context. If the context does not contain the answer, say so clearly.
 
@@ -91,7 +91,26 @@ class GroqLLM:
             async with client.stream(
                 "POST", GROQ_API_URL, json=payload, headers=headers
             ) as response:
-                response.raise_for_status()
+                # Surface API problems as clear, actionable errors instead of
+                # raw httpx exceptions (a 404 here almost always means the
+                # configured GROQ_MODEL id is invalid or decommissioned).
+                if response.status_code != 200:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    hint = ""
+                    if response.status_code == 404:
+                        hint = (
+                            f" Model '{self._model}' was not found on Groq. "
+                            "Check https://console.groq.com/docs/models for "
+                            "currently served model ids and update GROQ_MODEL."
+                        )
+                    elif response.status_code in (401, 403):
+                        hint = " Check your GROQ_API_KEY."
+                    elif response.status_code == 429:
+                        hint = " Rate limit exceeded - retry shortly."
+                    raise RuntimeError(
+                        f"Groq API error {response.status_code}: "
+                        f"{body[:300]}{hint}"
+                    )
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue

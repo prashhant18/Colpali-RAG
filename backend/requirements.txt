@@ -1,18 +1,44 @@
+# ---------------------------------------------------------------------------
+# PyTorch with CUDA support (for Python 3.12 / Windows)
+# ---------------------------------------------------------------------------
+# The default PyPI torch is CPU-only (raises "not compiled with CUDA enabled").
+# These pins come from PyTorch's cu126 index. torch 2.8.0+cu126 is the newest
+# CUDA build that satisfies sauerkrautlm-colpali's torch>=2.5.0,<2.9.0 and has
+# cp312 Windows wheels (matching the project's Python 3.12).
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.8.0+cu126
+torchvision==0.23.0+cu126
+
+# ---------------------------------------------------------------------------
+# Web framework
+# ---------------------------------------------------------------------------
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 pydantic==2.10.4
 pydantic-settings==2.7.1
+httpx==0.28.1
+python-dotenv==1.0.1
+
+# ---------------------------------------------------------------------------
+# PDF parsing / image rendering
+# ---------------------------------------------------------------------------
 pypdf==5.1.0
 pypdfium2==4.30.0
 pdf2image==1.17.0
 Pillow==11.1.0
+
+# ---------------------------------------------------------------------------
+# Vector DB
+# ---------------------------------------------------------------------------
 chromadb==0.6.3
-colpali-engine==0.3.1
-torch==2.5.1
-transformers==4.48.1
-sentencepiece==0.2.0
-protobuf==5.29.3
-accelerate==1.2.1
-httpx==0.28.1
-python-dotenv==1.0.1
+
+# ---------------------------------------------------------------------------
+# Multimodal retrieval dependencies (used by SauerkrautLM-ColLFM2-450M)
+# The ColLFM2 model itself is provided by VAGO's `sauerkrautlm-colpali` package,
+# installed separately with --no-deps (its torch pin conflicts with our CUDA build).
+# ---------------------------------------------------------------------------
+transformers>=4.57.1
+sentencepiece>=0.2.0
+protobuf>=5.29.0
+accelerate>=1.1.0
