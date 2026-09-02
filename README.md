@@ -2,7 +2,7 @@
 
 A complete, runnable **Retrieval-Augmented Generation (RAG)** application for academic research papers. Upload PDFs, ask natural-language questions, and get concise, synthesized answers with **inline citations** (source paper + page number).
 
-Built with **SauerkrautLM-ColLFM2-450M** (a lightweight 450M-parameter ColPali-class model, ~0.9 GB VRAM) for multimodal document retrieval, **FastAPI** for the backend, **Groq + Llama 3.3** for LLM inference, and a **React + Vite** single-page frontend.
+Built with **SauerkrautLM-ColLFM2-450M** (a lightweight 450M-parameter ColPali-class model, ~0.9 GB VRAM) for multimodal document retrieval, **FastAPI** for the backend, **Groq + GPT OSS-120B** for LLM inference, and a **React + Vite** frontend.
 
 ---
 
@@ -44,7 +44,7 @@ Built with **SauerkrautLM-ColLFM2-450M** (a lightweight 450M-parameter ColPali-c
 | **PDF Parsing** | `pypdf` + `pypdfium2` | Extract per-page text + render each page to an image |
 | **Embedding / Retrieval** | **SauerkrautLM-ColLFM2-450M** (`VAGOsolutions/SauerkrautLM-ColLFM2-450M-v0.1`) | Lightweight (450M, ~0.9 GB VRAM) late-interaction retrieval — treats pages as images |
 | **Vector DB** | **ChromaDB** (persistent, local) | Stores page embeddings + metadata (filename, page number) |
-| **LLM** | **Groq API** + Llama 3.3 70B | Generates synthesized answers with inline citations |
+| **LLM** | **Groq API** + GPT OSS 120B | Generates synthesized answers with inline citations |
 | **Backend** | **FastAPI** (Python 3.11+) | Ingestion pipeline, retrieval, SSE streaming |
 | **Frontend** | **React + Vite** | Drag-and-drop upload, chat UI with conversation history |
 
@@ -238,7 +238,7 @@ data: {"type": "done"}
 
 1. **Retrieve** — User question is embedded with ColLFM2; top-K most relevant pages are fetched from ChromaDB (cosine similarity).
 2. **Context** — Retrieved pages are formatted into a context block with source metadata.
-3. **Generate** — Groq Llama 3.3 streams a synthesized answer, instructed to cite sources inline as `[Author et al., YEAR, p. N]`.
+3. **Generate** — Groq GPT OSS-120B streams a synthesized answer, instructed to cite sources inline as `[Author et al., YEAR, p. N]`.
 4. **Stream** — The answer streams back to the frontend via SSE, along with the retrieved source list.
 
 ### 3. Source Attribution
